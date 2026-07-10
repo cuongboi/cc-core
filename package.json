@@ -1,16 +1,16 @@
 {
   "name": "cc-core",
   "version": "0.1.1",
-  "description": "A starter for creating a TypeScript package.",
-  "homepage": "https://github.com/cuongnc1201/cc-core#readme",
+  "description": "A CLI framework for building command-line tools",
+  "homepage": "https://github.com/cuongboi/cc-core#readme",
   "bugs": {
-    "url": "https://github.com/cuongnc1201/cc-core/issues"
+    "url": "https://github.com/cuongboi/cc-core/issues"
   },
   "license": "MIT",
-  "author": "CuongNguyen <[EMAIL_ADDRESS]>",
+  "author": "CuongNguyen <cuongnt2612@gmail.com>",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/cuongnc1201/cc-core.git"
+    "url": "git+https://github.com/cuongboi/cc-core.git"
   },
   "files": [
     "dist",
