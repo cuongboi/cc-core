@@ -6,5 +6,5 @@ export interface CommandInterface {
   options?: Option[];
   arguments?: Argument[];
   register(program: Command): void;
-  exec(...args: unknown[]): Promise<void> | void;
+  exec(...args: any[]): unknown;
 }

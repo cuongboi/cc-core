@@ -5,3 +5,4 @@ export * from "./decorators";
 export * from "./di";
 export * from "./commands";
 export * from "./utils";
+export * from "commander";

@@ -1,12 +1,18 @@
 import "reflect-metadata";
+import type { CommandInterface } from "../commands/command.interface";
+import type { InjectionToken, Provider, Type } from "../di/types";
 
 export const MODULE_METADATA = Symbol("MODULE_METADATA");
 
 export interface ModuleOptions {
-  imports?: any[];
-  providers?: any[];
-  exports?: any[];
-  commands?: any[];
+  /** Modules whose exported providers become available in this module. */
+  imports?: Type[];
+  /** Providers owned by this module. */
+  providers?: Provider[];
+  /** Tokens of this module's providers that importing modules may resolve. */
+  exports?: InjectionToken[];
+  /** Command classes registered on the CLI program. */
+  commands?: Type<CommandInterface>[];
 }
 
 export function Module(options: ModuleOptions): ClassDecorator {

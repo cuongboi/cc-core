@@ -1,4 +1,4 @@
-import { type Argument, Command, type Option } from "commander";
+import type { Argument, Command, Option } from "commander";
 import type { CommandInterface } from "./command.interface";
 
 export abstract class BaseCommand implements CommandInterface {
@@ -7,26 +7,27 @@ export abstract class BaseCommand implements CommandInterface {
   arguments?: Argument[];
   options?: Option[];
 
-  register(program: Command) {
+  /** Add this command to `program` and return the created sub-command. */
+  register(program: Command): Command {
     const command = program.command(this.name);
-    if (this.description) {
-      command.description(this.description);
-    }
 
-    if (this.options) {
-      for (const option of this.options) {
-        command.addOption(option);
-      }
-    }
+    if (this.description) command.description(this.description);
+    for (const option of this.options ?? []) command.addOption(option);
+    for (const argument of this.arguments ?? []) command.addArgument(argument);
 
-    if (this.arguments) {
-      for (const argument of this.arguments) {
-        command.addArgument(argument);
-      }
-    }
-
-    command.action(this.exec.bind(this));
+    this.configure(command);
+    // Pass the result through untouched: a returned promise is awaited by parseAsync(),
+    // while sync handlers keep throwing synchronously.
+    command.action((...args: unknown[]) => this.exec(...args) as void | Promise<void>);
+    return command;
   }
 
-  abstract exec(...args: unknown[]): Promise<any> | any;
+  /**
+   * Hook for anything the declarative fields don't cover (aliases, help text, hooks…).
+   * Called after options and arguments are added.
+   */
+  protected configure(_command: Command): void {}
+
+  /** Receives the positional arguments, then the parsed options, then the `Command`. */
+  abstract exec(...args: any[]): unknown;
 }

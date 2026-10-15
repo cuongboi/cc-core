@@ -37,6 +37,12 @@ export { Presets };
  * progress.stop();
  * ```
  */
+const BAR_DEFAULTS: CliProgressOptions = {
+  barCompleteChar: "█",
+  barIncompleteChar: "░",
+  hideCursor: true,
+};
+
 @Injectable()
 export class ProgressService {
   private single: SingleBar | null = null;
@@ -45,21 +51,16 @@ export class ProgressService {
   // ── Single-bar ──────────────────────────────────────────────────────────
 
   /**
-   * Start a single progress bar.
+   * Start a single progress bar, stopping any bar already running.
    * @param total    The total value (100 % mark).
    * @param startValue  Initial value (default 0).
    * @param payload  Extra tokens passed to the bar format string.
    * @param opts     cli-progress options (theme, format, …).
    */
   start(total: number, startValue = 0, payload: object = {}, opts: CliProgressOptions = {}): this {
+    this.stop();
     this.single = new SingleBar(
-      {
-        format: "{bar} {percentage}% | {value}/{total}",
-        barCompleteChar: "█",
-        barIncompleteChar: "░",
-        hideCursor: true,
-        ...opts,
-      },
+      { format: "{bar} {percentage}% | {value}/{total}", ...BAR_DEFAULTS, ...opts },
       Presets.shades_classic,
     );
     this.single.start(total, startValue, payload);
@@ -68,7 +69,7 @@ export class ProgressService {
 
   /**
    * Update the current value of the single bar.
-   * @param value    New value, or an increment amount when `increment` is true.
+   * @param value    The new absolute value.
    * @param payload  Optional payload tokens.
    */
   update(value: number, payload: object = {}): this {
@@ -85,16 +86,15 @@ export class ProgressService {
   // ── Multi-bar ───────────────────────────────────────────────────────────
 
   /**
-   * Initialize a multi-bar container.
+   * Initialize a multi-bar container, stopping any bar already running.
    * @param opts  cli-progress options shared by all child bars.
    */
   startMulti(opts: CliProgressOptions = {}): this {
+    this.stop();
     this.multi = new MultiBar(
       {
         format: "{label} {bar} {percentage}% | {value}/{total}",
-        barCompleteChar: "█",
-        barIncompleteChar: "░",
-        hideCursor: true,
+        ...BAR_DEFAULTS,
         clearOnComplete: false,
         ...opts,
       },
@@ -107,7 +107,7 @@ export class ProgressService {
    * Add a child bar to the multi-bar container.
    * Must call `startMulti()` first.
    *
-   * @returns The created `SingleBar` instance for individual control.
+   * @returns The created bar, for individual control.
    */
   addBar(total: number, startValue = 0, payload: object = {}): GenericBar {
     if (!this.multi) {

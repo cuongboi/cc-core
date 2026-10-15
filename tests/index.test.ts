@@ -1,6 +1,18 @@
 import "reflect-metadata";
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { Command, Option, Argument } from "commander";
+import {
+  DeleteObjectCommand,
+  DeleteObjectsCommand,
+  GetObjectCommand,
+  HeadObjectCommand,
+  ListObjectsV2Command,
+  PutObjectCommand,
+  type S3Client,
+} from "@aws-sdk/client-s3";
 
 import {
   Module,
@@ -12,8 +24,21 @@ import {
   debounce,
   throttle,
   StorageService,
+  LocalStorageAdapter,
+  MemoryStorageAdapter,
+  registerStorageDriver,
+  type S3StorageOptions,
+  type StorageAdapter,
+  type StorageConfig,
+  type StorageDriver,
   SpinnerService,
   ProgressService,
+  createProgram,
+  loadCommand,
+  CircularDependencyError,
+  InvalidProviderError,
+  ProviderNotFoundError,
+  ResolutionError,
 } from "../src/index";
 
 // ---------------------------------------------------------------------------
@@ -246,13 +271,22 @@ describe("DependencyContainer", () => {
     expect(() => node.resolve(UnknownService)).toThrowError(/Provider not found/);
   });
 
-  it("detects circular dependencies", () => {
-    // Note: the container's error message uses string interpolation with Symbol tokens;
-    // the circular-dependency check fires first but the error message construction
-    // may throw "Cannot convert a Symbol value to a string" before surfacing the
-    // "Circular dependency" text. Either way an error is thrown at resolve time.
+  it("detects circular dependencies and names the cycle", () => {
     const node = new DependencyContainer().getOrCreateModuleNode(CircularModule);
-    expect(() => node.resolve(CIR_A)).toThrow();
+    expect(() => node.resolve(CIR_A)).toThrowError(CircularDependencyError);
+    expect(() => node.resolve(CIR_A)).toThrowError(
+      "Circular dependency detected: Symbol(A) -> Symbol(B) -> Symbol(A)",
+    );
+  });
+
+  it("reports a missing symbol token without crashing on string conversion", () => {
+    @Module({})
+    class EmptySymbolModule {}
+
+    const MISSING = Symbol("Missing");
+    const node = new DependencyContainer().getOrCreateModuleNode(EmptySymbolModule);
+    expect(() => node.resolve(MISSING)).toThrowError(ProviderNotFoundError);
+    expect(() => node.resolve(MISSING)).toThrowError(/Provider not found: Symbol\(Missing\)/);
   });
 });
 
@@ -333,82 +367,286 @@ describe("BaseCommand", () => {
 // StorageService (built-in)
 // ---------------------------------------------------------------------------
 
-describe("StorageService", () => {
-  let storage: StorageService<string, unknown>;
+const collect = async <T>(iterable: AsyncIterable<T>): Promise<T[]> => {
+  const items: T[] = [];
+  for await (const item of iterable) items.push(item);
+  return items;
+};
+
+/** An in-memory S3 that answers the real SDK commands, paging listings 2 objects at a time. */
+class FakeS3 {
+  readonly objects = new Map<string, string>();
+  readonly sent: string[] = [];
+
+  async send(command: { input: any }): Promise<any> {
+    const input = command.input;
+    this.sent.push(command.constructor.name);
+    if (input.Bucket !== "bucket") throw Object.assign(new Error("no bucket"), { name: "NoSuchBucket" });
+
+    if (command instanceof GetObjectCommand) {
+      const body = this.objects.get(input.Key);
+      if (body === undefined) throw Object.assign(new Error("missing"), { name: "NoSuchKey" });
+      return { Body: { transformToString: async () => body } };
+    }
+    if (command instanceof HeadObjectCommand) {
+      if (!this.objects.has(input.Key)) throw Object.assign(new Error("missing"), { name: "NotFound" });
+      return {};
+    }
+    if (command instanceof PutObjectCommand) {
+      this.objects.set(input.Key, input.Body);
+      return {};
+    }
+    if (command instanceof DeleteObjectCommand) {
+      this.objects.delete(input.Key);
+      return {};
+    }
+    if (command instanceof DeleteObjectsCommand) {
+      for (const { Key } of input.Delete.Objects) this.objects.delete(Key);
+      return { Errors: [] };
+    }
+    if (command instanceof ListObjectsV2Command) {
+      const keys = [...this.objects.keys()]
+        .filter((key) => key.startsWith(input.Prefix))
+        .filter((key) => !input.Delimiter || !key.slice(input.Prefix.length).includes(input.Delimiter))
+        .sort();
+      const start = input.ContinuationToken ? Number(input.ContinuationToken) : 0;
+      const end = start + 2;
+      return {
+        Contents: keys.slice(start, end).map((Key) => ({ Key })),
+        IsTruncated: end < keys.length,
+        NextContinuationToken: end < keys.length ? String(end) : undefined,
+      };
+    }
+    throw new Error(`Unexpected command ${command.constructor.name}`);
+  }
+}
+
+let storageRoot: string;
+beforeEach(() => {
+  storageRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cc-core-storage-"));
+});
+afterEach(() => {
+  fs.rmSync(storageRoot, { recursive: true, force: true });
+});
+
+const storageDrivers: [string, (namespace: string) => StorageService<string | number>][] = [
+  ["local", (namespace) => new StorageService({ driver: "local", namespace, dir: storageRoot })],
+  ["memory", () => new StorageService({ driver: "memory" })],
+  [
+    "s3",
+    (namespace) =>
+      new StorageService({ driver: "s3", namespace, bucket: "bucket", client: new FakeS3() as unknown as S3Client }),
+  ],
+];
+
+describe.each(storageDrivers)("StorageService (%s driver)", (_, create) => {
+  let storage: StorageService<string | number>;
 
   beforeEach(() => {
-    // Unique sub-path per test to avoid cross-test pollution
-    storage = new StorageService(`test-${Date.now()}-${Math.random()}`);
+    storage = create("test");
   });
 
-  it("returns undefined for a missing key", () => {
-    expect(storage.get("nonexistent")).toBeUndefined();
+  it("returns undefined / false for a missing key", async () => {
+    expect(await storage.get("nonexistent")).toBeUndefined();
+    expect(await storage.has("ghost")).toBe(false);
+    expect(await storage.delete("nope")).toBe(false);
   });
 
-  it("has() returns false for a missing key", () => {
-    expect(storage.has("ghost")).toBe(false);
+  it("round-trips primitives and objects", async () => {
+    await storage.set("name", "Alice");
+    await storage.set("user", { age: 30, active: true });
+    expect(await storage.get("name")).toBe("Alice");
+    expect(await storage.get("user")).toEqual({ age: 30, active: true });
+    expect(await storage.has("user")).toBe(true);
   });
 
-  it("set/get round-trips a primitive value", () => {
-    storage.set("name", "Alice");
-    expect(storage.get("name")).toBe("Alice");
+  it("returns a fresh copy on every read", async () => {
+    await storage.set("obj", { n: 1 });
+    const first = await storage.get<{ n: number }>("obj");
+    first!.n = 2;
+    expect(await storage.get("obj")).toEqual({ n: 1 });
   });
 
-  it("set/get round-trips an object", () => {
-    storage.set("user", { age: 30, active: true });
-    expect(storage.get("user")).toEqual({ age: 30, active: true });
+  it("delete() removes a key and returns true", async () => {
+    await storage.set("temp", "gone");
+    expect(await storage.delete("temp")).toBe(true);
+    expect(await storage.has("temp")).toBe(false);
   });
 
-  it("has() returns true after set()", () => {
-    storage.set("key", 123);
-    expect(storage.has("key")).toBe(true);
+  it("round-trips keys with special characters without collisions", async () => {
+    const keys = ["a/b", "a_b", "../escape", "spaced key", "ünïcödé", "*?:<>|", "100%"];
+    for (const [i, key] of keys.entries()) await storage.set(key, i);
+
+    for (const [i, key] of keys.entries()) expect(await storage.get(key)).toBe(i);
+    expect((await collect(storage.keys())).sort()).toEqual([...keys].sort());
   });
 
-  it("delete() removes a key and returns true", () => {
-    storage.set("temp", "gone");
-    expect(storage.delete("temp")).toBe(true);
-    expect(storage.has("temp")).toBe(false);
+  it("yields canonical numeric keys back as numbers", async () => {
+    await storage.set(42, "a");
+    await storage.set("007", "b");
+    expect(await collect(storage.keys())).toEqual(expect.arrayContaining([42, "007"]));
   });
 
-  it("delete() returns false for a nonexistent key", () => {
-    expect(storage.delete("nope")).toBe(false);
+  it("rejects empty keys and values that are not JSON-serializable", async () => {
+    await expect(storage.set("", 1)).rejects.toThrow(TypeError);
+    await expect(storage.get("")).rejects.toThrow(TypeError);
+    await expect(storage.set("u", undefined)).rejects.toThrow(TypeError);
+    expect(await storage.has("u")).toBe(false);
   });
 
-  it("size reflects the number of stored entries", () => {
-    storage.set("a", 1);
-    storage.set("b", 2);
-    expect(storage.size).toBe(2);
+  it("size(), clear() and iteration cover every entry", async () => {
+    for (const key of ["a", "b", "c", "d", "e"]) await storage.set(key, key.toUpperCase());
+
+    expect(await storage.size()).toBe(5);
+    expect(await collect(storage)).toContainEqual(["c", "C"]);
+    expect((await collect(storage.values())).sort()).toEqual(["A", "B", "C", "D", "E"]);
+    expect(await collect(storage.entries())).toHaveLength(5);
+
+    const seen: unknown[] = [];
+    await storage.forEach((value, key) => seen.push([key, value]));
+    expect(seen).toHaveLength(5);
+
+    await storage.clear();
+    expect(await storage.size()).toBe(0);
   });
 
-  it("clear() removes all entries", () => {
-    storage.set("x", 1);
-    storage.set("y", 2);
-    storage.clear();
-    expect(storage.size).toBe(0);
+  it("keeps namespaces apart", async () => {
+    if (_ === "memory") return; // each memory adapter is its own namespace
+    const other = create("other");
+    await storage.set("k", "mine");
+    expect(await other.has("k")).toBe(false);
+  });
+});
+
+describe("LocalStorageAdapter", () => {
+  it("stores one JSON file per key under <dir>/<namespace>, created on first write", async () => {
+    const storage = new StorageService({ driver: "local", namespace: "app", dir: storageRoot });
+    const adapter = storage.adapter as LocalStorageAdapter;
+    expect(adapter.directory).toBe(path.join(storageRoot, "app"));
+    expect(fs.existsSync(adapter.directory)).toBe(false);
+
+    await storage.set("a/b", { big: "x".repeat(1000) });
+    expect(fs.readdirSync(storageRoot)).toEqual(["app"]); // nothing escaped the namespace
+    expect(fs.readdirSync(adapter.directory)).toEqual(["a%2Fb.json"]); // and no temp files left
   });
 
-  it("keys() iterates stored keys", () => {
-    storage.set("k1", "v1");
-    storage.set("k2", "v2");
-    expect([...storage.keys()]).toEqual(expect.arrayContaining(["k1", "k2"]));
+  it("survives concurrent writes to the same key", async () => {
+    const storage = new StorageService<string, number>({ driver: "local", dir: storageRoot });
+    await Promise.all(Array.from({ length: 20 }, (_, i) => storage.set("k", i)));
+    expect(typeof (await storage.get("k"))).toBe("number");
+    expect(fs.readdirSync(path.join(storageRoot, "default"))).toEqual(["k.json"]);
   });
 
-  it("values() iterates stored values", () => {
-    storage.set("a", "hello");
-    storage.set("b", "world");
-    expect([...storage.values()]).toEqual(expect.arrayContaining(["hello", "world"]));
+  it("rejects keys too long for a filename", async () => {
+    const storage = new StorageService({ driver: "local", dir: storageRoot });
+    await expect(storage.set("x".repeat(201), 1)).rejects.toThrow(RangeError);
   });
 
-  it("entries() iterates [key, value] pairs", () => {
-    storage.set("foo", "bar");
-    expect([...storage.entries()]).toContainEqual(["foo", "bar"]);
+  it("defaults to ./.storage/default", () => {
+    const adapter = new StorageService().adapter as LocalStorageAdapter;
+    expect(adapter.directory).toBe(path.join(process.cwd(), ".storage", "default"));
+  });
+});
+
+describe("S3StorageAdapter", () => {
+  const s3 = (fake: FakeS3, options: Partial<S3StorageOptions> & { namespace?: string } = {}) =>
+    new StorageService({
+      driver: "s3",
+      bucket: "bucket",
+      client: fake as unknown as S3Client,
+      namespace: "my-cli",
+      ...options,
+    });
+
+  it("writes JSON objects at <prefix>/<namespace>/<encoded key>.json", async () => {
+    const fake = new FakeS3();
+    await s3(fake, { prefix: "/apps/" }).set("user:1", { id: 1 });
+    expect([...fake.objects.keys()]).toEqual(["apps/my-cli/user%3A1.json"]);
+    expect(JSON.parse(fake.objects.get("apps/my-cli/user%3A1.json")!)).toEqual({ id: 1 });
   });
 
-  it("forEach() visits all entries", () => {
-    storage.set("x", 10);
-    const seen: [string, unknown][] = [];
-    storage.forEach((val, key) => seen.push([key, val]));
-    expect(seen).toContainEqual(["x", 10]);
+  it("does not list or clear the keys of a nested namespace", async () => {
+    const fake = new FakeS3();
+    const parent = s3(fake, { namespace: "a" });
+    await s3(fake, { namespace: "a/b" }).set("k", 1);
+    await parent.set("k", 2);
+
+    expect(await collect(parent.keys())).toEqual(["k"]);
+    await parent.clear();
+    expect([...fake.objects.keys()]).toEqual(["a/b/k.json"]);
+  });
+
+  it("pages through listings and clears with batched deletes", async () => {
+    const fake = new FakeS3();
+    const storage = s3(fake);
+    for (let i = 0; i < 5; i++) await storage.set(`k${i}`, i);
+    fake.objects.set("my-cli/not-ours.txt", "x");
+
+    expect(await storage.size()).toBe(5);
+    fake.sent.length = 0;
+    await storage.clear();
+    expect(fake.sent.filter((name) => name === "DeleteObjectsCommand")).toHaveLength(1);
+    expect([...fake.objects.keys()]).toEqual(["my-cli/not-ours.txt"]);
+  });
+
+  it("propagates errors other than a missing key", async () => {
+    const storage = s3(new FakeS3(), { bucket: "wrong" });
+    await expect(storage.get("k")).rejects.toMatchObject({ name: "NoSuchBucket" });
+    await expect(storage.has("k")).rejects.toMatchObject({ name: "NoSuchBucket" });
+  });
+
+  it("requires a bucket", () => {
+    expect(() => s3(new FakeS3(), { bucket: "" })).toThrow(/bucket/);
+  });
+});
+
+describe("storage drivers", () => {
+  /** Implements only the required methods, so the service's fallbacks are exercised. */
+  class MinimalAdapter implements StorageAdapter {
+    readonly map = new Map<string, string>();
+    constructor(readonly namespace = "") {}
+    async get(key: string) {
+      return this.map.get(key);
+    }
+    async set(key: string, value: string) {
+      this.map.set(key, value);
+    }
+    async delete(key: string) {
+      return this.map.delete(key);
+    }
+    async *keys() {
+      yield* this.map.keys();
+    }
+  }
+
+  it("accepts an adapter instance and falls back for optional methods", async () => {
+    const adapter = new MinimalAdapter();
+    const storage = new StorageService(adapter);
+    expect(storage.adapter).toBe(adapter);
+
+    await storage.set("a", 1);
+    await storage.set("b", 2);
+    expect(await storage.has("a")).toBe(true);
+    await storage.clear();
+    expect(adapter.map.size).toBe(0);
+  });
+
+  it("creates adapters from registered custom drivers", async () => {
+    registerStorageDriver("minimal" as StorageDriver, (_options, namespace) => new MinimalAdapter(namespace));
+    const storage = new StorageService({ driver: "minimal", namespace: "ns" } as unknown as StorageConfig);
+    expect(storage.adapter).toBeInstanceOf(MinimalAdapter);
+    expect((storage.adapter as MinimalAdapter).namespace).toBe("ns");
+  });
+
+  it("throws for an unknown driver", () => {
+    expect(() => new StorageService({ driver: "nope" } as unknown as StorageConfig)).toThrow(/Unknown storage driver "nope"/);
+  });
+
+  it("uses the memory driver without touching the filesystem", async () => {
+    const storage = new StorageService({ driver: "memory" });
+    await storage.set("k", 1);
+    expect(storage.adapter).toBeInstanceOf(MemoryStorageAdapter);
+    expect(fs.readdirSync(storageRoot)).toEqual([]);
   });
 });
 
@@ -874,5 +1112,231 @@ describe("ProgressService", () => {
   it("methods return `this` for chaining", () => {
     const progress = new ProgressService();
     expect(progress.start(10, 0).update(5).increment(2).stop()).toBe(progress);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DI edge cases: inheritance, property injection, diagnostics
+// ---------------------------------------------------------------------------
+
+const BASE_TOKEN = Symbol("BASE_TOKEN");
+
+@Injectable()
+class BaseConsumer {
+  constructor(@Inject(BASE_TOKEN) public value: string) {}
+}
+
+/** No constructor of its own: must inherit both param types and @Inject overrides. */
+@Injectable()
+class DerivedConsumer extends BaseConsumer {}
+
+const PROP_TOKEN = Symbol("PROP_TOKEN");
+
+@Injectable()
+class PropertyBase {
+  @Inject(PROP_TOKEN) base!: string;
+}
+
+@Injectable()
+class PropertyDerived extends PropertyBase {
+  @Inject(GreetingService) greeting!: GreetingService;
+}
+
+@Module({
+  providers: [
+    { provide: BASE_TOKEN, useValue: "from-base" },
+    { provide: PROP_TOKEN, useValue: "prop-value" },
+    GreetingService,
+    DerivedConsumer,
+    PropertyDerived,
+  ],
+})
+class InheritanceModule {}
+
+class Undecorated {
+  constructor(public greeting: GreetingService) {}
+}
+
+interface Config {
+  url: string;
+}
+
+@Injectable()
+class NeedsInterface {
+  constructor(public config: Config) {}
+}
+
+@Module({ providers: [GreetingService, Undecorated, NeedsInterface] })
+class DiagnosticsModule {}
+
+describe("DI edge cases", () => {
+  it("subclasses inherit constructor @Inject overrides from their parent", () => {
+    const node = new DependencyContainer().getOrCreateModuleNode(InheritanceModule);
+    expect(node.resolve(DerivedConsumer).value).toBe("from-base");
+  });
+
+  it("injects properties, including ones declared on a parent class", () => {
+    const node = new DependencyContainer().getOrCreateModuleNode(InheritanceModule);
+    const instance = node.resolve(PropertyDerived);
+    expect(instance.base).toBe("prop-value");
+    expect(instance.greeting).toBeInstanceOf(GreetingService);
+  });
+
+  it("explains missing type metadata instead of passing undefined", () => {
+    const node = new DependencyContainer().getOrCreateModuleNode(DiagnosticsModule);
+    expect(() => node.resolve(Undecorated)).toThrowError(/no constructor type metadata.*@Injectable/);
+  });
+
+  it("explains non-injectable parameter types such as interfaces", () => {
+    const node = new DependencyContainer().getOrCreateModuleNode(DiagnosticsModule);
+    expect(() => node.resolve(NeedsInterface)).toThrowError(
+      /parameter #0 of NeedsInterface: type "Object" is not injectable/,
+    );
+  });
+
+  it("includes the resolution path when a nested dependency is missing", () => {
+    @Module({ providers: [FarewellService] })
+    class MissingGreetingModule {}
+
+    const node = new DependencyContainer().getOrCreateModuleNode(MissingGreetingModule);
+    expect(() => node.resolve(FarewellService)).toThrowError(
+      /GreetingService in module MissingGreetingModule \(while resolving FarewellService\)/,
+    );
+  });
+
+  it("rejects importing a class that is not a module", () => {
+    @Module({ imports: [GreetingService] })
+    class BadImportModule {}
+
+    expect(() => new DependencyContainer().getOrCreateModuleNode(BadImportModule)).toThrowError(
+      /GreetingService is not a module/,
+    );
+  });
+
+  it("rejects malformed provider definitions", () => {
+    @Module({ providers: [{ provide: "nothing" } as any] })
+    class BadProviderModule {}
+
+    expect(() => new DependencyContainer().getOrCreateModuleNode(BadProviderModule)).toThrowError(
+      InvalidProviderError,
+    );
+  });
+
+  it("keeps earlier registrations when a later one sets multi: true", () => {
+    const TOKEN = Symbol("MIXED_MULTI");
+
+    @Module({
+      providers: [
+        { provide: TOKEN, useValue: "plain" },
+        { provide: TOKEN, useValue: "multi", multi: true },
+      ],
+    })
+    class MixedFlagModule {}
+
+    const node = new DependencyContainer().getOrCreateModuleNode(MixedFlagModule);
+    expect(node.resolve(TOKEN)).toEqual(["plain", "multi"]);
+  });
+
+  it("all container errors share the ResolutionError base class", () => {
+    const node = new DependencyContainer().getOrCreateModuleNode(CircularModule);
+    expect(() => node.resolve(CIR_A)).toThrowError(ResolutionError);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// createProgram / loadCommand
+// ---------------------------------------------------------------------------
+
+const commandLog: string[] = [];
+
+@Injectable()
+class SharedCommand extends BaseCommand {
+  name = "shared";
+  constructor(private greeting: GreetingService) {
+    super();
+  }
+  exec() {
+    commandLog.push(this.greeting.greet("shared"));
+  }
+}
+
+@Injectable()
+class SlowCommand extends BaseCommand {
+  name = "slow";
+  async exec() {
+    await wait(10);
+    commandLog.push("slow-done");
+  }
+}
+
+@Injectable()
+class FailingCommand extends BaseCommand {
+  name = "fail";
+  async exec() {
+    throw new Error("boom");
+  }
+}
+
+@Module({ providers: [GreetingService], commands: [SharedCommand], exports: [GreetingService] })
+class SharedCommandModule {}
+
+/** Imports SharedCommandModule twice via two paths: commands must register once. */
+@Module({ imports: [SharedCommandModule] })
+class SiblingModule {}
+
+@Module({ imports: [SharedCommandModule, SiblingModule], commands: [SlowCommand, FailingCommand] })
+class CliRootModule {}
+
+describe("createProgram / loadCommand", () => {
+  beforeEach(() => {
+    commandLog.length = 0;
+  });
+
+  it("registers commands from every module exactly once", () => {
+    const program = createProgram(CliRootModule, { name: "cli", version: "1.2.3" });
+    expect(program.commands.map((c) => c.name()).sort()).toEqual(["fail", "shared", "slow"]);
+    expect(program.version()).toBe("1.2.3");
+  });
+
+  it("resolves command dependencies from the command's own module", async () => {
+    await loadCommand(CliRootModule, { name: "cli" }, ["node", "cli", "shared"]);
+    expect(commandLog).toEqual(["Hello, shared!"]);
+  });
+
+  it("waits for async exec() before resolving", async () => {
+    await loadCommand(CliRootModule, { name: "cli" }, ["node", "cli", "slow"]);
+    expect(commandLog).toEqual(["slow-done"]);
+  });
+
+  it("rejects when exec() throws", async () => {
+    await expect(
+      loadCommand(CliRootModule, { name: "cli" }, ["node", "cli", "fail"]),
+    ).rejects.toThrow("boom");
+  });
+
+  it("calls the configure() hook with the sub-command", () => {
+    class AliasedCommand extends BaseCommand {
+      name = "status";
+      protected override configure(command: Command) {
+        command.alias("st");
+      }
+      exec() {}
+    }
+
+    const program = new Command("cli");
+    expect(new AliasedCommand().register(program).aliases()).toEqual(["st"]);
+  });
+});
+
+describe("ProgressService restarts", () => {
+  it("start() stops a bar that is already running", () => {
+    const progress = new ProgressService();
+    progress.start(10);
+    const first = progress.rawSingle!;
+    const stopSpy = vi.spyOn(first, "stop");
+    progress.start(20);
+    expect(stopSpy).toHaveBeenCalledOnce();
+    expect(progress.rawSingle).not.toBe(first);
+    progress.stop();
   });
 });

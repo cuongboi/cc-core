@@ -1,21 +1,23 @@
-export const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+export const wait = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
 
-export const debounce = (fn: Function, ms: number) => {
-  let timer: NodeJS.Timeout;
-  return (...args: any[]) => {
+/** Delay calls to `fn` until `ms` have passed without another call; the last arguments win. */
+export const debounce = <A extends unknown[]>(fn: (...args: A) => unknown, ms: number) => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return (...args: A): void => {
     clearTimeout(timer);
     timer = setTimeout(() => fn(...args), ms);
   };
 };
 
-export const throttle = (fn: Function, ms: number) => {
-  let timer: NodeJS.Timeout | null = null;
-  return (...args: any[]) => {
-    if (!timer) {
-      fn(...args);
-      timer = setTimeout(() => {
-        timer = null;
-      }, ms);
-    }
+/** Call `fn` immediately, then ignore further calls for `ms`. */
+export const throttle = <A extends unknown[]>(fn: (...args: A) => unknown, ms: number) => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return (...args: A): void => {
+    if (timer) return;
+    fn(...args);
+    timer = setTimeout(() => {
+      timer = undefined;
+    }, ms);
   };
 };
