@@ -1,5 +1,9 @@
 # cc-core
 
+[![npm version](https://img.shields.io/npm/v/cc-core.svg)](https://www.npmjs.com/package/cc-core)
+[![npm downloads](https://img.shields.io/npm/dm/cc-core.svg)](https://www.npmjs.com/package/cc-core)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/cuongboi/cc-core)
+
 NestJS-style **modules and dependency injection** for [commander.js](https://github.com/tj/commander.js) CLIs. Declare commands as classes, inject services into them, and let one call wire everything into a `commander` program.
 
 ```ts
@@ -25,7 +29,7 @@ class GreetCommand extends BaseCommand {
 - **Providers**: `useClass`, `useValue`, `useFactory`, and multi-providers
 - **Clear errors**: the full resolution path is reported for missing providers, cycles and missing type metadata
 - **Async-aware bootstrap**: `loadCommand` awaits async commands and surfaces their errors
-- **Built-ins**: `StorageService` (JSON key-value store with `local`, `s3` and `memory` drivers, or your own adapter), `SpinnerService` ([ora](https://github.com/sindresorhus/ora)), `ProgressService` ([cli-progress](https://github.com/npkgjs/cli-progress))
+- **Built-ins**: `StorageService` (JSON key-value store with `local`, `s3` and `memory` drivers, or your own adapter), task scheduling (`@Cron`, `@Interval`, `@Timeout` via [croner](https://github.com/hexagon/croner)), `Logger` ([pino](https://getpino.io), pretty or JSON, to stderr), `SpinnerService` ([ora](https://github.com/sindresorhus/ora)), `ProgressService` ([cli-progress](https://github.com/npkgjs/cli-progress))
 - **Utilities**: `wait`, `debounce`, `throttle`
 - Re-exports all of `commander` (`Command`, `Option`, `Argument`, …), so you need only one import source
 
@@ -55,7 +59,20 @@ class GreetCommand extends BaseCommand {
 npm install cc-core
 ```
 
-`commander`, `reflect-metadata`, `ora` and `cli-progress` are installed as dependencies, and `reflect-metadata` is loaded for you.
+Or using your package manager of choice:
+
+```bash
+# pnpm
+pnpm add cc-core
+
+# yarn
+yarn add cc-core
+
+# bun
+bun add cc-core
+```
+
+`commander`, `reflect-metadata`, `pino`, `pino-pretty`, `ora` and `cli-progress` are installed as dependencies, and `reflect-metadata` is loaded for you.
 
 ## Quick start
 
@@ -383,6 +400,117 @@ registerStorageDriver("redis", ({ url }, namespace) => new RedisAdapter(new Redi
 new StorageService({ driver: "redis", url: "redis://localhost", namespace: "my-cli" });
 ```
 
+### Scheduling
+
+Import `ScheduleModule` once, decorate methods on any provider, and let a long-running command run them:
+
+```ts
+import { BaseCommand, Cron, CronExpression, Inject, Injectable, Interval, Module,
+  ScheduleModule, ScheduleOrchestrator, Timeout } from "cc-core";
+
+@Injectable()
+class ReportTasks {
+  constructor(private reports: ReportService) {}
+
+  @Cron(CronExpression.EVERY_DAY_AT_MIDNIGHT, { timeZone: "Asia/Ho_Chi_Minh" })
+  nightly() { return this.reports.build(); }
+
+  @Interval("poll", 10_000) // or @Interval(10_000, { name, allowOverlap, runOnStart, disabled })
+  poll() { /* … */ }
+
+  @Timeout(5_000)
+  warmup() { /* … */ }
+}
+
+class WorkerCommand extends BaseCommand {
+  name = "worker";
+  constructor(@Inject(ScheduleOrchestrator) private scheduler: ScheduleOrchestrator) { super(); }
+  exec() { return this.scheduler.run(); }
+}
+
+@Module({ imports: [ScheduleModule], providers: [ReportService, ReportTasks], commands: [WorkerCommand] })
+class AppModule {}
+```
+
+- **Lazy**: nothing is scheduled until `start()` / `run()`, so other commands never start timers or hang the process.
+- **Discovery** covers every module in the graph. Providers registered with `useClass` or `useValue` are found; `useFactory` ones aren't (their class is unknown until created) — add those via the registry.
+- **`run({ signals?, signal?, onError? })`** resolves on `SIGINT`/`SIGTERM`, when `signal` aborts, or once no job is left (e.g. only timeouts, all fired), then waits for running jobs to finish. A second Ctrl+C exits immediately.
+- **No pile-ups**: a tick is skipped while the previous run of that job is still in progress, unless `allowOverlap: true`.
+- **Failures are isolated**: a throwing job is reported to `onError` (default: logged as an error by [`Logger`](#logger) under the `Schedule` context) and keeps its schedule.
+- Cron expressions take 5 fields, or 6 with leading seconds; invalid expressions, time zones and delays throw when the class is defined.
+
+`SchedulerRegistry` manages jobs at runtime. Jobs added while the scheduler is started start immediately:
+
+```ts
+registry.addCron("backup", CronExpression.EVERY_DAY_AT_2AM, () => backup(), { timeZone: "UTC" });
+registry.addInterval("heartbeat", 30_000, () => ping());
+registry.get("backup")?.nextRunAt;  // also: isRunning, lastRunAt, runCount, run(), start(), stop()
+registry.getJobs("cron");
+await registry.delete("backup");    // stops it and waits for a running backup to finish
+```
+
+### `Logger`
+
+A context-aware wrapper around [pino](https://getpino.io), with readable output from [pino-pretty](https://github.com/pinojs/pino-pretty). Create one per class:
+
+```ts
+import { Logger } from "cc-core";
+
+@Injectable()
+class DeployService {
+  private readonly logger = new Logger(DeployService.name);
+
+  async deploy(files: string[]) {
+    this.logger.info("Uploading %d files", files.length); // INFO: [DeployService] Uploading 3 files
+    this.logger.debug({ files }, "file list");            // hidden unless the level is debug or trace
+    try {
+      await upload(files);
+    } catch (error) {
+      this.logger.error(error, "Upload failed");          // error first: stack and cause chain included
+    }
+  }
+}
+```
+
+- **Calls use pino's signature**: `logger.info(message, ...args)` or `logger.info(objectOrError, message?, ...args)`. Object fields become structured fields on the line.
+- **Levels**, most severe first: `fatal`, `error`, `warn`, `info`, `debug`, `trace`. Use `"silent"` to write nothing. The default is `$LOG_LEVEL` if it is set, otherwise `info`.
+- **Writes to stderr**, so logs never end up in a command's piped stdout. Pass `stream` to write somewhere else.
+- **Formats**: `"pretty"` (the default) and `"json"`, which is pino's NDJSON with label levels and ISO timestamps:
+  `{"level":"info","time":"2026-10-15T03:30:12.872Z","context":"Deploy:S3","key":"a.zip","msg":"put"}`
+- **Never loses lines on `process.exit()`.** Output is written synchronously in-process, not through a pino transport, which would run in a worker thread.
+- **Colors** are used on a TTY only. `NO_COLOR` and `FORCE_COLOR` are respected.
+
+`Logger.configure()` sets options for every logger, and loggers created before the call pick them up too, because each one rebuilds its pino instance after a `configure()`. This lets you wire up global flags after commands and services have been built:
+
+```ts
+import { LOG_LEVELS, Option } from "cc-core";
+
+const program = createProgram(AppModule, { name: "my-cli" })
+  .option("-v, --verbose", "show debug output")
+  .addOption(new Option("--log-level <level>").choices(["silent", ...LOG_LEVELS]))
+  .option("--json", "machine-readable logs")
+  .hook("preAction", (cmd) => {
+    const { verbose, logLevel, json } = cmd.opts();
+    Logger.configure({ level: logLevel ?? (verbose ? "debug" : undefined), format: json ? "json" : "pretty" });
+  });
+
+await program.parseAsync();
+```
+
+| Member                                               | Description                                                         |
+| ---------------------------------------------------- | ------------------------------------------------------------------- |
+| `new Logger(context?, options?)`                     | Options set here override the global ones for this logger           |
+| `fatal` / `error` / `warn` / `info` / `debug` / `trace` | pino's log methods                                               |
+| `isLevelEnabled(level)`                              | Check this before building an expensive message                     |
+| `child(context, bindings?)`                          | A logger with the context `parent:context`, the same options, and `bindings` added to every line |
+| `level` / `context`                                  | The current threshold and the context                               |
+| `raw`                                                | The underlying pino logger                                          |
+| `Logger.configure(options)` / `Logger.resetConfig()` | Merge into or reset the global options                              |
+
+Options: `level`, `format` (`"pretty"` \| `"json"`), `timestamp` (local time in pretty output, default `false`), `colors`, `stream` (any `{ write(string) }`), and `pino` (raw [pino options](https://getpino.io/#/docs/api?id=options) such as `redact`, `serializers` or `mixin`, applied last). An invalid level throws a `TypeError`. The environment (`LOG_LEVEL`, `NO_COLOR`, `FORCE_COLOR`) is read when the pino instance is built.
+
+`Logger` is not decorated with `@Injectable()`. If you list it as a plain provider, it is created without a context. For a logger with a context or options, use `useFactory` or create it in the class as shown above. The pino `Logger` and `LoggerOptions` types are re-exported as `PinoLogger` and `PinoOptions`.
+
 ### `SpinnerService`
 
 An injectable wrapper around [ora](https://github.com/sindresorhus/ora).
@@ -469,7 +597,7 @@ src/
 ├── decorators/   @Module, @Injectable, @Inject
 ├── di/           DependencyContainer, ModuleNode, provider types, errors
 ├── commands/     BaseCommand, createProgram, loadCommand
-├── built-in/     StorageService (+ local / s3 / memory adapters), SpinnerService, ProgressService
+├── built-in/     StorageService (+ local / s3 / memory adapters), scheduling, Logger, SpinnerService, ProgressService
 ├── utils/        wait, debounce, throttle
 └── index.ts      public API (also re-exports commander)
 ```

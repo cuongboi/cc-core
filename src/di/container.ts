@@ -23,6 +23,11 @@ const NON_INJECTABLE_TYPES = new Set<unknown>([Object, String, Number, Boolean, 
 export class DependencyContainer {
   private readonly moduleNodes = new Map<Type, ModuleNode>();
 
+  /** Every module node created so far, i.e. the whole graph reachable from the roots. */
+  get modules(): IterableIterator<ModuleNode> {
+    return this.moduleNodes.values();
+  }
+
   getOrCreateModuleNode(moduleClass: Type): ModuleNode {
     const existing = this.moduleNodes.get(moduleClass);
     if (existing) return existing;
@@ -35,7 +40,7 @@ export class DependencyContainer {
     }
 
     // Register before walking imports so circular module imports terminate.
-    const node = new ModuleNode(moduleClass, metadata);
+    const node = new ModuleNode(moduleClass, metadata, this);
     this.moduleNodes.set(moduleClass, node);
 
     for (const imported of metadata.imports ?? []) {
@@ -44,6 +49,14 @@ export class DependencyContainer {
 
     return node;
   }
+}
+
+/** One provider definition as registered in a module, for discovery. */
+export interface RegisteredProvider {
+  token: InjectionToken;
+  definition: ProviderDefinition;
+  /** Position within a multi-provider's array, or `undefined` for a single provider. */
+  multiIndex: number | undefined;
 }
 
 interface ProviderEntry {
@@ -64,6 +77,7 @@ export class ModuleNode {
   constructor(
     readonly moduleClass: Type,
     readonly metadata: ModuleOptions,
+    readonly container: DependencyContainer,
   ) {
     for (const provider of metadata.providers ?? []) {
       this.register(provider);
@@ -92,6 +106,15 @@ export class ModuleNode {
 
   exportsToken(token: InjectionToken): boolean {
     return this.metadata.exports?.includes(token) ?? false;
+  }
+
+  /** Every provider definition owned by this module (not imported ones), without instantiating any. */
+  *providerDefinitions(): IterableIterator<RegisteredProvider> {
+    for (const [token, { multi, definitions }] of this.providers) {
+      for (const [index, definition] of definitions.entries()) {
+        yield { token, definition, multiIndex: multi ? index : undefined };
+      }
+    }
   }
 
   resolve<T = any>(token: InjectionToken<T>, path: InjectionToken[] = []): T {
@@ -123,6 +146,9 @@ export class ModuleNode {
         return imported.resolve(token, path);
       }
     }
+
+    // The container is implicitly available everywhere, e.g. for provider discovery.
+    if (token === DependencyContainer) return this.container as T;
 
     throw new ProviderNotFoundError(token, this.moduleClass, path);
   }
